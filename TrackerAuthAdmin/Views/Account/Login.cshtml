@@ -1,9 +1,9 @@
 ﻿@using Microsoft.AspNetCore.Mvc.Localization
-@using MyProject.STS.Identity.Configuration.Interfaces
-@using MyProject.STS.Identity.Helpers.Localization
+@using TrackerLibrary.Configurations.Common.Interfaces
+@using TrackerAuthAdmin.Configuration.IdentityServer.Helpers.Localization
 @inject IViewLocalizer Localizer
-@model MyProject.STS.Identity.ViewModels.Account.LoginViewModel
-@inject IRootConfiguration RootConfiguration
+@model TrackerLibrary.ViewModels.Accounts.LoginViewModel
+@inject TrackerLibrary.Configurations.Common.Interfaces.IRootConfiguration RootConfiguration
 
 <div class="login-page">
     <div class="page-header">
