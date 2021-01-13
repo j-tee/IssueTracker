@@ -16,6 +16,8 @@ namespace TrackerAuthAdmin.Configuration.Constants
         public const string IdentityDbConnectionStringKey = "IdentityDbConnection";
 
         public const string DataProtectionDbConnectionStringKey = "DataProtectionDbConnection";
+        
+        public const string IssuesDbConnectionStringKey = "IssuesDbConnection";
 
         public const string ResourcesPath = "Resources";
 
@@ -24,6 +26,16 @@ namespace TrackerAuthAdmin.Configuration.Constants
         public const string RegisterConfigurationKey = "RegisterConfiguration";
 
         public const string AdvancedConfigurationKey = "AdvancedConfiguration";
+
         public const string CspTrustedDomainsKey = "CspTrustedDomains";
+
+       public const string AdminLogDbConnectionStringKey = "AdminLogDbConnection";        
+
+        public const string IdentityServerDataConfigurationKey = "IdentityServerData";
+
+        public const string IdentityDataConfigurationKey = "IdentityData";
+
+        public const string AdminAuditLogDbConnectionStringKey = "AdminAuditLogDbConnection";
+
     }
 }

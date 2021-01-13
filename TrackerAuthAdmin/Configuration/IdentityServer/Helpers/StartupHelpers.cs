@@ -1,26 +1,33 @@
-﻿using IdentityServer4.EntityFramework.Storage;
+﻿using IdentityServer4.EntityFramework.Options;
 using Microsoft.AspNetCore.Authentication;
-using Microsoft.AspNetCore.Authentication.AzureAD.UI;
+using Microsoft.AspNetCore.Authentication.Cookies;
+using Microsoft.AspNetCore.Authentication.OpenIdConnect;
 using Microsoft.AspNetCore.Builder;
-using Microsoft.AspNetCore.DataProtection;
 using Microsoft.AspNetCore.DataProtection.EntityFrameworkCore;
 using Microsoft.AspNetCore.Http;
 using Microsoft.AspNetCore.HttpOverrides;
 using Microsoft.AspNetCore.Identity;
-using Microsoft.AspNetCore.Identity.UI.Services;
 using Microsoft.AspNetCore.Localization;
 using Microsoft.AspNetCore.Mvc.Razor;
-using Microsoft.Azure.KeyVault;
-using Microsoft.Azure.Services.AppAuthentication;
+using Microsoft.AspNetCore.Mvc.ViewFeatures;
 using Microsoft.EntityFrameworkCore;
 using Microsoft.Extensions.Configuration;
-using Microsoft.Extensions.Configuration.AzureKeyVault;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.DependencyInjection.Extensions;
 using Microsoft.Extensions.Options;
-using SendGrid;
+using Microsoft.IdentityModel.Tokens;
+using Skoruba.AuditLogging.EntityFramework.DbContexts;
+using Skoruba.AuditLogging.EntityFramework.Entities;
+using Skoruba.AuditLogging.EntityFramework.Extensions;
+using Skoruba.AuditLogging.EntityFramework.Repositories;
+using Skoruba.AuditLogging.EntityFramework.Services;
+using Skoruba.IdentityServer4.Admin.BusinessLogic.Identity.Dtos.Identity;
+using Skoruba.IdentityServer4.Admin.BusinessLogic.Services;
+using Skoruba.IdentityServer4.Admin.BusinessLogic.Services.Interfaces;
 using Skoruba.IdentityServer4.Admin.EntityFramework.Helpers;
 using Skoruba.IdentityServer4.Admin.EntityFramework.Interfaces;
+using Skoruba.IdentityServer4.Admin.EntityFramework.Repositories;
+using Skoruba.IdentityServer4.Admin.EntityFramework.Repositories.Interfaces;
 using System;
 using System.Collections.Generic;
 using System.Globalization;
@@ -29,72 +36,134 @@ using System.Threading.Tasks;
 using TrackerAuthAdmin.Configuration.ApplicationParts;
 using TrackerAuthAdmin.Configuration.Constants;
 using TrackerAuthAdmin.Configuration.IdentityServer.Helpers.Localization;
-using TrackerAuthAdmin.Configuration.Interfaces;
+using TrackerAuthAdmin.ExceptionHandling;
 using TrackerAuthAdmin.Extensions;
 using TrackerLibrary.Configurations.Common;
-using TrackerLibrary.Email;
+using TrackerLibrary.Configurations.Common.Interfaces;
+using TrackerLibrary.Configurations.Constants;
 using TrackerLibrary.Shared;
-using TrackerLibrary.Shared.Helpers;
 
 namespace TrackerAuthAdmin.Configuration.IdentityServer.Helpers
 {
     public static class StartupHelpers
     {
-        /// <summary>
-        /// Register services for MVC and localization including available languages
-        /// </summary>
-        /// <param name="services"></param>
-        public static IMvcBuilder AddMvcWithLocalization<TUser, TKey>(this IServiceCollection services, IConfiguration configuration)
-            where TUser : IdentityUser<TKey>
-            where TKey : IEquatable<TKey>
+        public static IServiceCollection AddAuditEventLogging<TAuditLoggingDbContext, TAuditLog>(this IServiceCollection services, IConfiguration configuration)
+            where TAuditLog : AuditLog, new()
+            where TAuditLoggingDbContext : IAuditLoggingDbContext<TAuditLog>
         {
-            services.AddLocalization(opts => { opts.ResourcesPath = ConfigurationConsts.ResourcesPath; });
+            var auditLoggingConfiguration = configuration.GetSection(nameof(AuditLoggingConfiguration)).Get<AuditLoggingConfiguration>();
 
-            services.TryAddTransient(typeof(IGenericControllerLocalizer<>), typeof(GenericControllerLocalizer<>));
-
-            var mvcBuilder = services.AddControllersWithViews(o =>
-            {
-                o.Conventions.Add(new GenericControllerRouteConvention());
-            })
-                .AddViewLocalization(
-                    LanguageViewLocationExpanderFormat.Suffix,
-                    opts => { opts.ResourcesPath = ConfigurationConsts.ResourcesPath; })
-                .AddDataAnnotationsLocalization()
-                .ConfigureApplicationPartManager(m =>
+            services.AddAuditLogging(options => { options.Source = auditLoggingConfiguration.Source; })
+                .AddDefaultHttpEventData(subjectOptions =>
                 {
-                    m.FeatureProviders.Add(new GenericTypeControllerFeatureProvider<TUser, TKey>());
-                });
+                    subjectOptions.SubjectIdentifierClaim = auditLoggingConfiguration.SubjectIdentifierClaim;
+                    subjectOptions.SubjectNameClaim = auditLoggingConfiguration.SubjectNameClaim;
+                },
+                    actionOptions =>
+                    {
+                        actionOptions.IncludeFormVariables = auditLoggingConfiguration.IncludeFormVariables;
+                    })
+                .AddAuditSinks<DatabaseAuditEventLoggerSink<TAuditLog>>();
 
-            var cultureConfiguration = configuration.GetSection(nameof(CultureConfiguration)).Get<CultureConfiguration>();
-            services.Configure<RequestLocalizationOptions>(
-                opts =>
-                {
-                    // If cultures are specified in the configuration, use them (making sure they are among the available cultures),
-                    // otherwise use all the available cultures
-                    var supportedCultureCodes = (cultureConfiguration?.Cultures?.Count > 0 ?
-                        cultureConfiguration.Cultures.Intersect(CultureConfiguration.AvailableCultures) :
-                        CultureConfiguration.AvailableCultures).ToArray();
+            // repository for library
+            services.AddTransient<IAuditLoggingRepository<TAuditLog>, AuditLoggingRepository<TAuditLoggingDbContext, TAuditLog>>();
 
-                    if (!supportedCultureCodes.Any()) supportedCultureCodes = CultureConfiguration.AvailableCultures;
-                    var supportedCultures = supportedCultureCodes.Select(c => new CultureInfo(c)).ToList();
+            // repository and service for admin
+            services.AddTransient<IAuditLogRepository<TAuditLog>, AuditLogRepository<TAuditLoggingDbContext, TAuditLog>>();
+            services.AddTransient<IAuditLogService, AuditLogService<TAuditLog>>();
 
-                    // If the default culture is specified use it, otherwise use CultureConfiguration.DefaultRequestCulture ("en")
-                    var defaultCultureCode = string.IsNullOrEmpty(cultureConfiguration?.DefaultCulture) ?
-                        CultureConfiguration.DefaultRequestCulture : cultureConfiguration?.DefaultCulture;
-
-                    // If the default culture is not among the supported cultures, use the first supported culture as default
-                    if (!supportedCultureCodes.Contains(defaultCultureCode)) defaultCultureCode = supportedCultureCodes.FirstOrDefault();
-
-                    opts.DefaultRequestCulture = new RequestCulture(defaultCultureCode);
-                    opts.SupportedCultures = supportedCultures;
-                    opts.SupportedUICultures = supportedCultures;
-                });
-
-            return mvcBuilder;
+            return services;
         }
 
         /// <summary>
-        /// Using of Forwarded Headers and Referrer Policy
+        /// Register DbContexts for IdentityServer ConfigurationStore and PersistedGrants, Identity and Logging
+        /// Configure the connection strings in AppSettings.json
+        /// </summary>
+        /// <typeparam name="TConfigurationDbContext"></typeparam>
+        /// <typeparam name="TPersistedGrantDbContext"></typeparam>
+        /// <typeparam name="TLogDbContext"></typeparam>
+        /// <typeparam name="TIdentityDbContext"></typeparam>
+        /// <typeparam name="TAuditLoggingDbContext"></typeparam>
+        /// <param name="services"></param>
+        /// <param name="configuration"></param>
+        public static void RegisterDbContexts<TIdentityDbContext, TConfigurationDbContext, TPersistedGrantDbContext, TLogDbContext, TAuditLoggingDbContext, TDataProtectionDbContext>(this IServiceCollection services, IConfiguration configuration)
+            where TIdentityDbContext : DbContext
+            where TPersistedGrantDbContext : DbContext, IAdminPersistedGrantDbContext
+            where TConfigurationDbContext : DbContext, IAdminConfigurationDbContext
+            where TLogDbContext : DbContext, IAdminLogDbContext
+            where TAuditLoggingDbContext : DbContext, IAuditLoggingDbContext<AuditLog>
+            where TDataProtectionDbContext : DbContext, IDataProtectionKeyContext
+        {
+            var databaseProvider = configuration.GetSection(nameof(DatabaseProviderConfiguration)).Get<DatabaseProviderConfiguration>();
+
+            var identityConnectionString = configuration.GetConnectionString(ConfigurationConsts.IdentityDbConnectionStringKey);
+            var configurationConnectionString = configuration.GetConnectionString(ConfigurationConsts.ConfigurationDbConnectionStringKey);
+            var persistedGrantsConnectionString = configuration.GetConnectionString(ConfigurationConsts.PersistedGrantDbConnectionStringKey);
+            var errorLoggingConnectionString = configuration.GetConnectionString(ConfigurationConsts.AdminLogDbConnectionStringKey);
+            var auditLoggingConnectionString = configuration.GetConnectionString(ConfigurationConsts.AdminAuditLogDbConnectionStringKey);
+            var dataProtectionConnectionString = configuration.GetConnectionString(ConfigurationConsts.DataProtectionDbConnectionStringKey);
+            services.RegisterSqlServerDbContexts<TIdentityDbContext, TConfigurationDbContext, TPersistedGrantDbContext, TLogDbContext, TAuditLoggingDbContext, TDataProtectionDbContext>(identityConnectionString, configurationConnectionString, persistedGrantsConnectionString, errorLoggingConnectionString, auditLoggingConnectionString, dataProtectionConnectionString);
+            //switch (databaseProvider.ProviderType)
+            //{
+            //    case DatabaseProviderType.SqlServer:
+                    
+            //        break;
+            //    case DatabaseProviderType.PostgreSQL:
+            //        services.RegisterNpgSqlDbContexts<TIdentityDbContext, TConfigurationDbContext, TPersistedGrantDbContext, TLogDbContext, TAuditLoggingDbContext, TDataProtectionDbContext>(identityConnectionString, configurationConnectionString, persistedGrantsConnectionString, errorLoggingConnectionString, auditLoggingConnectionString, dataProtectionConnectionString);
+            //        break;
+            //    case DatabaseProviderType.MySql:
+            //        services.RegisterMySqlDbContexts<TIdentityDbContext, TConfigurationDbContext, TPersistedGrantDbContext, TLogDbContext, TAuditLoggingDbContext, TDataProtectionDbContext>(identityConnectionString, configurationConnectionString, persistedGrantsConnectionString, errorLoggingConnectionString, auditLoggingConnectionString, dataProtectionConnectionString);
+            //        break;
+            //    default:
+            //        throw new ArgumentOutOfRangeException(nameof(databaseProvider.ProviderType), $@"The value needs to be one of {string.Join(", ", Enum.GetNames(typeof(DatabaseProviderType)))}.");
+            //}
+        }
+
+        /// <summary>
+        /// Register in memory DbContexts for IdentityServer ConfigurationStore and PersistedGrants, Identity and Logging
+        /// For testing purpose only
+        /// </summary>
+        /// <typeparam name="TConfigurationDbContext"></typeparam>
+        /// <typeparam name="TPersistedGrantDbContext"></typeparam>
+        /// <typeparam name="TLogDbContext"></typeparam>
+        /// <typeparam name="TIdentityDbContext"></typeparam>
+        /// <typeparam name="TAuditLoggingDbContext"></typeparam>
+        /// <param name="services"></param>
+        public static void RegisterDbContextsStaging<TIdentityDbContext, TConfigurationDbContext, TPersistedGrantDbContext, TLogDbContext, TAuditLoggingDbContext, TDataProtectionDbContext>(this IServiceCollection services)
+            where TIdentityDbContext : DbContext
+            where TPersistedGrantDbContext : DbContext, IAdminPersistedGrantDbContext
+            where TConfigurationDbContext : DbContext, IAdminConfigurationDbContext
+            where TLogDbContext : DbContext, IAdminLogDbContext
+            where TAuditLoggingDbContext : DbContext, IAuditLoggingDbContext<AuditLog>
+            where TDataProtectionDbContext : DbContext, IDataProtectionKeyContext
+        {
+            var persistedGrantsDatabaseName = Guid.NewGuid().ToString();
+            var configurationDatabaseName = Guid.NewGuid().ToString();
+            var logDatabaseName = Guid.NewGuid().ToString();
+            var identityDatabaseName = Guid.NewGuid().ToString();
+            var auditLoggingDatabaseName = Guid.NewGuid().ToString();
+            var dataProtectionDatabaseName = Guid.NewGuid().ToString();
+
+            var operationalStoreOptions = new OperationalStoreOptions();
+            services.AddSingleton(operationalStoreOptions);
+
+            var storeOptions = new ConfigurationStoreOptions();
+            services.AddSingleton(storeOptions);
+
+            services.AddDbContext<TIdentityDbContext>(optionsBuilder => optionsBuilder.UseInMemoryDatabase(identityDatabaseName));
+            services.AddDbContext<TPersistedGrantDbContext>(optionsBuilder => optionsBuilder.UseInMemoryDatabase(persistedGrantsDatabaseName));
+            services.AddDbContext<TConfigurationDbContext>(optionsBuilder => optionsBuilder.UseInMemoryDatabase(configurationDatabaseName));
+            services.AddDbContext<TLogDbContext>(optionsBuilder => optionsBuilder.UseInMemoryDatabase(logDatabaseName));
+            services.AddDbContext<TAuditLoggingDbContext>(optionsBuilder => optionsBuilder.UseInMemoryDatabase(auditLoggingDatabaseName));
+            services.AddDbContext<TDataProtectionDbContext>(optionsBuilder => optionsBuilder.UseInMemoryDatabase(dataProtectionDatabaseName));
+        }
+        public static void UseMvcLocalizationServices(this IApplicationBuilder app)
+        {
+            var options = app.ApplicationServices.GetService<IOptions<RequestLocalizationOptions>>();
+            app.UseRequestLocalization(options.Value);
+        }
+        /// <summary>
+        /// Using of Forwarded Headers, Hsts, XXssProtection and Csp
         /// </summary>
         /// <param name="app"></param>
         /// <param name="configuration"></param>
@@ -110,6 +179,9 @@ namespace TrackerAuthAdmin.Configuration.IdentityServer.Helpers
 
             app.UseForwardedHeaders(forwardingOptions);
 
+            app.UseXXssProtection(options => options.EnabledWithBlockMode());
+            app.UseXContentTypeOptions();
+            app.UseXfo(options => options.SameOrigin());
             app.UseReferrerPolicy(options => options.NoReferrer());
 
             // CSP Configuration to be able to use external resources
@@ -137,6 +209,7 @@ namespace TrackerAuthAdmin.Configuration.IdentityServer.Helpers
                         options.CustomSources = cspTrustedDomains;
                         options.Enabled = true;
                         options.UnsafeInlineSrc = true;
+                        options.UnsafeEvalSrc = true;
                     });
                     csp.StyleSources(options =>
                     {
@@ -153,96 +226,154 @@ namespace TrackerAuthAdmin.Configuration.IdentityServer.Helpers
                     });
                 });
             }
-
         }
 
         /// <summary>
-        /// Register DbContexts for IdentityServer ConfigurationStore, PersistedGrants, Identity and DataProtection
-        /// Configure the connection strings in AppSettings.json
+        /// Add middleware for localization
         /// </summary>
-        /// <typeparam name="TConfigurationDbContext"></typeparam>
-        /// <typeparam name="TPersistedGrantDbContext"></typeparam>
-        /// <typeparam name="TIdentityDbContext"></typeparam>
-        /// <param name="services"></param>
-        /// <param name="configuration"></param>
-        public static void RegisterDbContexts<TIdentityDbContext, TConfigurationDbContext, TPersistedGrantDbContext, TDataProtectionDbContext>(this IServiceCollection services, IConfiguration configuration)
-            where TIdentityDbContext : DbContext
-            where TPersistedGrantDbContext : DbContext, IAdminPersistedGrantDbContext
-            where TConfigurationDbContext : DbContext, IAdminConfigurationDbContext
-            where TDataProtectionDbContext : DbContext, IDataProtectionKeyContext
+        /// <param name="app"></param>
+        public static void ConfigureLocalization(this IApplicationBuilder app)
         {
-            var databaseProvider = configuration.GetSection(nameof(DatabaseProviderConfiguration)).Get<DatabaseProviderConfiguration>();
-
-            var identityConnectionString = configuration.GetConnectionString(ConfigurationConsts.IdentityDbConnectionStringKey);
-            var configurationConnectionString = configuration.GetConnectionString(ConfigurationConsts.ConfigurationDbConnectionStringKey);
-            var persistedGrantsConnectionString = configuration.GetConnectionString(ConfigurationConsts.PersistedGrantDbConnectionStringKey);
-            var dataProtectionConnectionString = configuration.GetConnectionString(ConfigurationConsts.DataProtectionDbConnectionStringKey);
-            services.RegisterSqlServerDbContexts<TIdentityDbContext, TConfigurationDbContext, TPersistedGrantDbContext, TDataProtectionDbContext>(identityConnectionString, configurationConnectionString, persistedGrantsConnectionString, dataProtectionConnectionString);
+            var options = app.ApplicationServices.GetService<IOptions<RequestLocalizationOptions>>();
+            app.UseRequestLocalization(options.Value);
         }
 
         /// <summary>
-        /// Register InMemory DbContexts for IdentityServer ConfigurationStore, PersistedGrants, Identity and DataProtection
-        /// Configure the connection strings in AppSettings.json
+        /// Add authorization policies
         /// </summary>
-        /// <typeparam name="TConfigurationDbContext"></typeparam>
-        /// <typeparam name="TPersistedGrantDbContext"></typeparam>
-        /// <typeparam name="TIdentityDbContext"></typeparam>
         /// <param name="services"></param>
-        public static void RegisterDbContextsStaging<TIdentityDbContext, TConfigurationDbContext, TPersistedGrantDbContext, TDataProtectionDbContext>(
+        public static void AddAuthorizationPolicies(this IServiceCollection services, IRootConfiguration rootConfiguration)
+        {
+            services.AddAuthorization(options =>
+            {
+                options.AddPolicy(AuthorizationConsts.AdministrationPolicy,
+                    policy => policy.RequireRole(rootConfiguration.AdminConfiguration.AdministrationRole));
+            });
+        }
+
+        /// <summary>
+        /// Add exception filter for controller
+        /// </summary>
+        /// <param name="services"></param>
+        public static void AddMvcExceptionFilters(this IServiceCollection services)
+        {
+            //Exception handling
+            services.AddScoped<ControllerExceptionFilterAttribute>();
+        }
+
+        /// <summary>
+        /// Register services for MVC and localization including available languages
+        /// </summary>
+        /// <param name="services"></param>
+        public static void AddMvcWithLocalization<TUserDto, TRoleDto, TUser, TRole, TKey, TUserClaim, TUserRole, TUserLogin, TRoleClaim, TUserToken,
+            TUsersDto, TRolesDto, TUserRolesDto, TUserClaimsDto,
+            TUserProviderDto, TUserProvidersDto, TUserChangePasswordDto, TRoleClaimsDto, TUserClaimDto, TRoleClaimDto>(this IServiceCollection services, IConfiguration configuration)
+            where TUserDto : UserDto<TKey>, new()
+            where TRoleDto : RoleDto<TKey>, new()
+            where TUser : IdentityUser<TKey>
+            where TRole : IdentityRole<TKey>
+            where TKey : IEquatable<TKey>
+            where TUserClaim : IdentityUserClaim<TKey>
+            where TUserRole : IdentityUserRole<TKey>
+            where TUserLogin : IdentityUserLogin<TKey>
+            where TRoleClaim : IdentityRoleClaim<TKey>
+            where TUserToken : IdentityUserToken<TKey>
+            where TUsersDto : UsersDto<TUserDto, TKey>
+            where TRolesDto : RolesDto<TRoleDto, TKey>
+            where TUserRolesDto : UserRolesDto<TRoleDto, TKey>
+            where TUserClaimsDto : UserClaimsDto<TUserClaimDto, TKey>
+            where TUserProviderDto : UserProviderDto<TKey>
+            where TUserProvidersDto : UserProvidersDto<TUserProviderDto, TKey>
+            where TUserChangePasswordDto : UserChangePasswordDto<TKey>
+            where TRoleClaimsDto : RoleClaimsDto<TRoleClaimDto, TKey>
+            where TUserClaimDto : UserClaimDto<TKey>
+            where TRoleClaimDto : RoleClaimDto<TKey>
+        {
+            services.AddSingleton<ITempDataProvider, CookieTempDataProvider>();
+
+            services.AddLocalization(opts => { opts.ResourcesPath = ConfigurationConsts.ResourcesPath; });
+
+            services.TryAddTransient(typeof(IGenericControllerLocalizer<>), typeof(GenericControllerLocalizer<>));
+
+            services.AddControllersWithViews(o =>
+            {
+                o.Conventions.Add(new GenericControllerRouteConvention());
+            })
+                .AddViewLocalization(
+                    LanguageViewLocationExpanderFormat.Suffix,
+                    opts => { opts.ResourcesPath = ConfigurationConsts.ResourcesPath; })
+                .AddDataAnnotationsLocalization()
+                .ConfigureApplicationPartManager(m =>
+                {
+                    m.FeatureProviders.Add(new GenericTypeControllerFeatureProvider<TUserDto, TRoleDto, TUser, TRole, TKey, TUserClaim, TUserRole, TUserLogin, TRoleClaim, TUserToken,
+                        TUsersDto, TRolesDto, TUserRolesDto, TUserClaimsDto,
+                        TUserProviderDto, TUserProvidersDto, TUserChangePasswordDto, TRoleClaimsDto, TUserClaimDto, TRoleClaimDto>());
+                });
+
+            var cultureConfiguration = configuration.GetSection(nameof(CultureConfiguration)).Get<CultureConfiguration>();
+            services.Configure<RequestLocalizationOptions>(
+            opts =>
+            {
+                // If cultures are specified in the configuration, use them (making sure they are among the available cultures),
+                // otherwise use all the available cultures
+                var supportedCultureCodes = (cultureConfiguration?.Cultures?.Count > 0 ?
+                    cultureConfiguration.Cultures.Intersect(CultureConfiguration.AvailableCultures) :
+                    CultureConfiguration.AvailableCultures).ToArray();
+
+                if (!supportedCultureCodes.Any()) supportedCultureCodes = CultureConfiguration.AvailableCultures;
+                var supportedCultures = supportedCultureCodes.Select(c => new CultureInfo(c)).ToList();
+
+                // If the default culture is specified use it, otherwise use CultureConfiguration.DefaultRequestCulture ("en")
+                var defaultCultureCode = string.IsNullOrEmpty(cultureConfiguration?.DefaultCulture) ?
+                    CultureConfiguration.DefaultRequestCulture : cultureConfiguration?.DefaultCulture;
+
+                // If the default culture is not among the supported cultures, use the first supported culture as default
+                if (!supportedCultureCodes.Contains(defaultCultureCode)) defaultCultureCode = supportedCultureCodes.FirstOrDefault();
+
+                opts.DefaultRequestCulture = new RequestCulture(defaultCultureCode);
+                opts.SupportedCultures = supportedCultures;
+                opts.SupportedUICultures = supportedCultures;
+            });
+        }
+
+        public static void AddAuthenticationServicesStaging<TContext, TUserIdentity, TUserIdentityRole>(
             this IServiceCollection services)
-            where TIdentityDbContext : DbContext
-            where TPersistedGrantDbContext : DbContext, IAdminPersistedGrantDbContext
-            where TConfigurationDbContext : DbContext, IAdminConfigurationDbContext
-            where TDataProtectionDbContext : DbContext, IDataProtectionKeyContext
+            where TContext : DbContext where TUserIdentity : class where TUserIdentityRole : class
         {
-            var identityDatabaseName = Guid.NewGuid().ToString();
-            services.AddDbContext<TIdentityDbContext>(optionsBuilder => optionsBuilder.UseInMemoryDatabase(identityDatabaseName));
-
-            var configurationDatabaseName = Guid.NewGuid().ToString();
-            var operationalDatabaseName = Guid.NewGuid().ToString();
-            var dataProtectionDatabaseName = Guid.NewGuid().ToString();
-
-            services.AddConfigurationDbContext<TConfigurationDbContext>(options =>
+            services.AddIdentity<TUserIdentity, TUserIdentityRole>(options =>
             {
-                options.ConfigureDbContext = b => b.UseInMemoryDatabase(configurationDatabaseName);
-            });
+                options.User.RequireUniqueEmail = true;
+            })
+                .AddEntityFrameworkStores<TContext>()
+                .AddDefaultTokenProviders();
 
-            services.AddOperationalDbContext<TPersistedGrantDbContext>(options =>
+            services.AddAuthentication(options =>
             {
-                options.ConfigureDbContext = b => b.UseInMemoryDatabase(operationalDatabaseName);
-            });
+                options.DefaultScheme = CookieAuthenticationDefaults.AuthenticationScheme;
+                options.DefaultChallengeScheme = CookieAuthenticationDefaults.AuthenticationScheme;
 
-            services.AddDbContext<TDataProtectionDbContext>(options =>
-            {
-                options.UseInMemoryDatabase(dataProtectionDatabaseName);
-            });
+                options.DefaultAuthenticateScheme = CookieAuthenticationDefaults.AuthenticationScheme;
+                options.DefaultForbidScheme = CookieAuthenticationDefaults.AuthenticationScheme;
+                options.DefaultSignInScheme = CookieAuthenticationDefaults.AuthenticationScheme;
+                options.DefaultSignOutScheme = CookieAuthenticationDefaults.AuthenticationScheme;
+            })
+                .AddCookie(CookieAuthenticationDefaults.AuthenticationScheme);
         }
 
         /// <summary>
-        /// Add services for authentication, including Identity model, IdentityServer4 and external providers
+        /// Register services for authentication, including Identity.
+        /// For production mode is used OpenId Connect middleware which is connected to IdentityServer4 instance.
+        /// For testing purpose is used cookie middleware with fake login url.
         /// </summary>
-        /// <typeparam name="TIdentityDbContext">DbContext for Identity</typeparam>
-        /// <typeparam name="TUserIdentity">User Identity class</typeparam>
-        /// <typeparam name="TUserIdentityRole">User Identity Role class</typeparam>
+        /// <typeparam name="TContext"></typeparam>
+        /// <typeparam name="TUserIdentity"></typeparam>
+        /// <typeparam name="TUserIdentityRole"></typeparam>
         /// <param name="services"></param>
         /// <param name="configuration"></param>
-        public static void AddAuthenticationServices<TIdentityDbContext, TUserIdentity, TUserIdentityRole>(this IServiceCollection services, IConfiguration configuration) where TIdentityDbContext : DbContext
-            where TUserIdentity : class
-            where TUserIdentityRole : class
+        public static void AddAuthenticationServices<TContext, TUserIdentity, TUserIdentityRole>(this IServiceCollection services, IConfiguration configuration)
+            where TContext : DbContext where TUserIdentity : class where TUserIdentityRole : class
         {
-            var loginConfiguration = GetLoginConfiguration(configuration);
-            var registrationConfiguration = GetRegistrationConfiguration(configuration);
-            var identityOptions = configuration.GetSection(nameof(IdentityOptions)).Get<IdentityOptions>();
-
-            services
-                .AddSingleton(registrationConfiguration)
-                .AddSingleton(loginConfiguration)
-                .AddSingleton(identityOptions)
-                .AddScoped<ApplicationSignInManager<TUserIdentity>>()
-                .AddScoped<UserResolver<TUserIdentity>>()
-                .AddIdentity<TUserIdentity, TUserIdentityRole>(options => configuration.GetSection(nameof(IdentityOptions)).Bind(options))
-                .AddEntityFrameworkStores<TIdentityDbContext>()
-                .AddDefaultTokenProviders();
+            var adminConfiguration = configuration.GetSection(nameof(AdminConfiguration)).Get<AdminConfiguration>();
 
             services.Configure<CookiePolicyOptions>(options =>
             {
@@ -254,169 +385,100 @@ namespace TrackerAuthAdmin.Configuration.IdentityServer.Helpers
                     AuthenticationHelpers.CheckSameSite(cookieContext.Context, cookieContext.CookieOptions);
             });
 
-            services.Configure<IISOptions>(iis =>
+            services
+                .AddIdentity<TUserIdentity, TUserIdentityRole>(options => configuration.GetSection(nameof(IdentityOptions)).Bind(options))
+                .AddEntityFrameworkStores<TContext>()
+                .AddDefaultTokenProviders();
+
+            services.AddAuthentication(options =>
             {
-                iis.AuthenticationDisplayName = "Windows";
-                iis.AutomaticAuthentication = false;
-            });
+                options.DefaultScheme = CookieAuthenticationDefaults.AuthenticationScheme;
+                options.DefaultChallengeScheme = AuthenticationConsts.OidcAuthenticationScheme;
 
-            var authenticationBuilder = services.AddAuthentication();
-
-            AddExternalProviders(authenticationBuilder, configuration);
-        }
-
-        /// <summary>
-        /// Get configuration for login
-        /// </summary>
-        /// <param name="configuration"></param>
-        /// <returns></returns>
-        private static LoginConfiguration GetLoginConfiguration(IConfiguration configuration)
-        {
-            var loginConfiguration = configuration.GetSection(nameof(LoginConfiguration)).Get<LoginConfiguration>();
-
-            // Cannot load configuration - use default configuration values
-            if (loginConfiguration == null)
-            {
-                return new LoginConfiguration();
-            }
-
-            return loginConfiguration;
-        }
-
-        /// <summary>
-        /// Get configuration for registration
-        /// </summary>
-        /// <param name="configuration"></param>
-        /// <returns></returns>
-        private static RegisterConfiguration GetRegistrationConfiguration(IConfiguration configuration)
-        {
-            var registerConfiguration = configuration.GetSection(nameof(RegisterConfiguration)).Get<RegisterConfiguration>();
-
-            // Cannot load configuration - use default configuration values
-            if (registerConfiguration == null)
-            {
-                return new RegisterConfiguration();
-            }
-
-            return registerConfiguration;
-        }
-
-        /// <summary>
-        /// Add configuration for IdentityServer4
-        /// </summary>
-        /// <typeparam name="TUserIdentity"></typeparam>
-        /// <typeparam name="TConfigurationDbContext"></typeparam>
-        /// <typeparam name="TPersistedGrantDbContext"></typeparam>
-        /// <param name="services"></param>
-        /// <param name="configuration"></param>
-        public static IIdentityServerBuilder AddIdentityServer<TConfigurationDbContext, TPersistedGrantDbContext, TUserIdentity>(
-            this IServiceCollection services,
-            IConfiguration configuration)
-            where TPersistedGrantDbContext : DbContext, IAdminPersistedGrantDbContext
-            where TConfigurationDbContext : DbContext, IAdminConfigurationDbContext
-            where TUserIdentity : class
-        {
-            var advancedConfiguration = configuration.GetSection(nameof(AdvancedConfiguration)).Get<AdvancedConfiguration>();
-
-            var builder = services.AddIdentityServer(options =>
-            {
-                options.Events.RaiseErrorEvents = true;
-                options.Events.RaiseInformationEvents = true;
-                options.Events.RaiseFailureEvents = true;
-                options.Events.RaiseSuccessEvents = true;
-
-                if (!string.IsNullOrEmpty(advancedConfiguration.IssuerUri))
-                {
-                    options.IssuerUri = advancedConfiguration.IssuerUri;
-                }
+                options.DefaultAuthenticateScheme = CookieAuthenticationDefaults.AuthenticationScheme;
+                options.DefaultForbidScheme = CookieAuthenticationDefaults.AuthenticationScheme;
+                options.DefaultSignInScheme = CookieAuthenticationDefaults.AuthenticationScheme;
+                options.DefaultSignOutScheme = CookieAuthenticationDefaults.AuthenticationScheme;
             })
-                .AddConfigurationStore<TConfigurationDbContext>()
-                .AddOperationalStore<TPersistedGrantDbContext>()
-                .AddAspNetIdentity<TUserIdentity>();
+                    .AddCookie(CookieAuthenticationDefaults.AuthenticationScheme,
+                        options =>
+                        {
+                            options.Cookie.Name = adminConfiguration.IdentityAdminCookieName;
+                        })
+                    .AddOpenIdConnect(AuthenticationConsts.OidcAuthenticationScheme, options =>
+                    {
+                        options.Authority = adminConfiguration.IdentityServerBaseUrl;
+                        options.RequireHttpsMetadata = adminConfiguration.RequireHttpsMetadata;
+                        options.ClientId = adminConfiguration.ClientId;
+                        options.ClientSecret = adminConfiguration.ClientSecret;
+                        options.ResponseType = adminConfiguration.OidcResponseType;
 
-            builder.AddCustomSigningCredential(configuration);
-            builder.AddCustomValidationKey(configuration);
-            builder.AddExtensionGrantValidator<DelegationGrantValidator>();
+                        options.Scope.Clear();
+                        foreach (var scope in adminConfiguration.Scopes)
+                        {
+                            options.Scope.Add(scope);
+                        }
 
-            return builder;
+                        options.ClaimActions.MapJsonKey(adminConfiguration.TokenValidationClaimRole, adminConfiguration.TokenValidationClaimRole, adminConfiguration.TokenValidationClaimRole);
+
+                        options.SaveTokens = true;
+
+                        options.GetClaimsFromUserInfoEndpoint = true;
+
+                        options.TokenValidationParameters = new TokenValidationParameters
+                        {
+                            NameClaimType = adminConfiguration.TokenValidationClaimName,
+                            RoleClaimType = adminConfiguration.TokenValidationClaimRole
+                        };
+
+                        options.Events = new OpenIdConnectEvents
+                        {
+                            OnMessageReceived = context => OnMessageReceived(context, adminConfiguration),
+                            OnRedirectToIdentityProvider = context => OnRedirectToIdentityProvider(context, adminConfiguration)
+                        };
+                    });
         }
 
-        /// <summary>
-        /// Add external providers
-        /// </summary>
-        /// <param name="authenticationBuilder"></param>
-        /// <param name="configuration"></param>
-        private static void AddExternalProviders(AuthenticationBuilder authenticationBuilder,
-            IConfiguration configuration)
+        private static Task OnMessageReceived(MessageReceivedContext context, AdminConfiguration adminConfiguration)
         {
-            var externalProviderConfiguration = configuration.GetSection(nameof(ExternalProvidersConfiguration)).Get<ExternalProvidersConfiguration>();
+            context.Properties.IsPersistent = true;
+            context.Properties.ExpiresUtc = new DateTimeOffset(DateTime.Now.AddHours(adminConfiguration.IdentityAdminCookieExpiresUtcHours));
 
-            if (externalProviderConfiguration.UseGitHubProvider)
-            {
-                authenticationBuilder.AddGitHub(options =>
-                {
-                    options.ClientId = externalProviderConfiguration.GitHubClientId;
-                    options.ClientSecret = externalProviderConfiguration.GitHubClientSecret;
-                    options.Scope.Add("user:email");
-                });
-            }
-
-            if (externalProviderConfiguration.UseAzureAdProvider)
-            {
-                authenticationBuilder.AddAzureAD(AzureADDefaults.AuthenticationScheme, AzureADDefaults.OpenIdScheme, AzureADDefaults.CookieScheme, AzureADDefaults.DisplayName, options =>
-                {
-                    options.ClientSecret = externalProviderConfiguration.AzureAdSecret;
-                    options.ClientId = externalProviderConfiguration.AzureAdClientId;
-                    options.TenantId = externalProviderConfiguration.AzureAdTenantId;
-                    options.Instance = externalProviderConfiguration.AzureInstance;
-                    options.Domain = externalProviderConfiguration.AzureDomain;
-                    options.CallbackPath = externalProviderConfiguration.AzureAdCallbackPath;
-                    options.CookieSchemeName = IdentityConstants.ExternalScheme;
-                });
-            }
+            return Task.FromResult(0);
         }
 
-        /// <summary>
-        /// Register middleware for localization
-        /// </summary>
-        /// <param name="app"></param>
-        public static void UseMvcLocalizationServices(this IApplicationBuilder app)
+        private static Task OnRedirectToIdentityProvider(RedirectContext n, AdminConfiguration adminConfiguration)
         {
-            var options = app.ApplicationServices.GetService<IOptions<RequestLocalizationOptions>>();
-            app.UseRequestLocalization(options.Value);
+            n.ProtocolMessage.RedirectUri = adminConfiguration.IdentityAdminRedirectUri;
+
+            return Task.FromResult(0);
         }
 
-        /// <summary>
-        /// Add authorization policies
-        /// </summary>
-        /// <param name="services"></param>
-        /// <param name="rootConfiguration"></param>
-        public static void AddAuthorizationPolicies(this IServiceCollection services,
-                IRootConfiguration rootConfiguration)
-        {
-            services.AddAuthorization(options =>
-            {
-                options.AddPolicy(AuthorizationConsts.AdministrationPolicy,
-                    policy => policy.RequireRole(rootConfiguration.AdminConfiguration.AdministrationRole));
-            });
-        }
-
-        public static void AddIdSHealthChecks<TConfigurationDbContext, TPersistedGrantDbContext, TIdentityDbContext, TDataProtectionDbContext>(this IServiceCollection services, IConfiguration configuration)
+        public static void AddIdSHealthChecks<TConfigurationDbContext, TPersistedGrantDbContext, TIdentityDbContext, TLogDbContext, TAuditLoggingDbContext, TDataProtectionDbContext>(this IServiceCollection services, IConfiguration configuration, AdminConfiguration adminConfiguration)
             where TConfigurationDbContext : DbContext, IAdminConfigurationDbContext
             where TPersistedGrantDbContext : DbContext, IAdminPersistedGrantDbContext
             where TIdentityDbContext : DbContext
+            where TLogDbContext : DbContext, IAdminLogDbContext
+            where TAuditLoggingDbContext : DbContext, IAuditLoggingDbContext<AuditLog>
             where TDataProtectionDbContext : DbContext, IDataProtectionKeyContext
         {
             var configurationDbConnectionString = configuration.GetConnectionString(ConfigurationConsts.ConfigurationDbConnectionStringKey);
             var persistedGrantsDbConnectionString = configuration.GetConnectionString(ConfigurationConsts.PersistedGrantDbConnectionStringKey);
             var identityDbConnectionString = configuration.GetConnectionString(ConfigurationConsts.IdentityDbConnectionStringKey);
+            var logDbConnectionString = configuration.GetConnectionString(ConfigurationConsts.AdminLogDbConnectionStringKey);
+            var auditLogDbConnectionString = configuration.GetConnectionString(ConfigurationConsts.AdminAuditLogDbConnectionStringKey);
             var dataProtectionDbConnectionString = configuration.GetConnectionString(ConfigurationConsts.DataProtectionDbConnectionStringKey);
 
+            var identityServerUri = adminConfiguration.IdentityServerBaseUrl;
             var healthChecksBuilder = services.AddHealthChecks()
                 .AddDbContextCheck<TConfigurationDbContext>("ConfigurationDbContext")
                 .AddDbContextCheck<TPersistedGrantDbContext>("PersistedGrantsDbContext")
                 .AddDbContextCheck<TIdentityDbContext>("IdentityDbContext")
-                .AddDbContextCheck<TDataProtectionDbContext>("DataProtectionDbContext");
+                .AddDbContextCheck<TLogDbContext>("LogDbContext")
+                .AddDbContextCheck<TAuditLoggingDbContext>("AuditLogDbContext")
+                .AddDbContextCheck<TDataProtectionDbContext>("DataProtectionDbContext")
+
+                .AddIdentityServer(new Uri(identityServerUri), "Identity Server");
 
             var serviceProvider = services.BuildServiceProvider();
             var scopeFactory = serviceProvider.GetRequiredService<IServiceScopeFactory>();
@@ -425,6 +487,8 @@ namespace TrackerAuthAdmin.Configuration.IdentityServer.Helpers
                 var configurationTableName = DbContextHelpers.GetEntityTable<TConfigurationDbContext>(scope.ServiceProvider);
                 var persistedGrantTableName = DbContextHelpers.GetEntityTable<TPersistedGrantDbContext>(scope.ServiceProvider);
                 var identityTableName = DbContextHelpers.GetEntityTable<TIdentityDbContext>(scope.ServiceProvider);
+                var logTableName = DbContextHelpers.GetEntityTable<TLogDbContext>(scope.ServiceProvider);
+                var auditLogTableName = DbContextHelpers.GetEntityTable<TAuditLoggingDbContext>(scope.ServiceProvider);
                 var dataProtectionTableName = DbContextHelpers.GetEntityTable<TDataProtectionDbContext>(scope.ServiceProvider);
 
                 var databaseProvider = configuration.GetSection(nameof(DatabaseProviderConfiguration)).Get<DatabaseProviderConfiguration>();
@@ -438,9 +502,12 @@ namespace TrackerAuthAdmin.Configuration.IdentityServer.Helpers
                                 healthQuery: $"SELECT TOP 1 * FROM dbo.[{persistedGrantTableName}]")
                             .AddSqlServer(identityDbConnectionString, name: "IdentityDb",
                                 healthQuery: $"SELECT TOP 1 * FROM dbo.[{identityTableName}]")
+                            .AddSqlServer(logDbConnectionString, name: "LogDb",
+                                healthQuery: $"SELECT TOP 1 * FROM dbo.[{logTableName}]")
+                            .AddSqlServer(auditLogDbConnectionString, name: "AuditLogDb",
+                                healthQuery: $"SELECT TOP 1 * FROM dbo.[{auditLogTableName}]")
                             .AddSqlServer(dataProtectionDbConnectionString, name: "DataProtectionDb",
                                 healthQuery: $"SELECT TOP 1 * FROM dbo.[{dataProtectionTableName}]");
-
                         break;
                     case DatabaseProviderType.PostgreSQL:
                         healthChecksBuilder
@@ -450,6 +517,10 @@ namespace TrackerAuthAdmin.Configuration.IdentityServer.Helpers
                                 healthQuery: $"SELECT * FROM \"{persistedGrantTableName}\" LIMIT 1")
                             .AddNpgSql(identityDbConnectionString, name: "IdentityDb",
                                 healthQuery: $"SELECT * FROM \"{identityTableName}\" LIMIT 1")
+                            .AddNpgSql(logDbConnectionString, name: "LogDb",
+                                healthQuery: $"SELECT * FROM \"{logTableName}\" LIMIT 1")
+                            .AddNpgSql(auditLogDbConnectionString, name: "AuditLogDb",
+                                healthQuery: $"SELECT * FROM \"{auditLogTableName}\"  LIMIT 1")
                             .AddNpgSql(dataProtectionDbConnectionString, name: "DataProtectionDb",
                                 healthQuery: $"SELECT * FROM \"{dataProtectionTableName}\"  LIMIT 1");
                         break;
@@ -458,6 +529,8 @@ namespace TrackerAuthAdmin.Configuration.IdentityServer.Helpers
                             .AddMySql(configurationDbConnectionString, name: "ConfigurationDb")
                             .AddMySql(persistedGrantsDbConnectionString, name: "PersistentGrantsDb")
                             .AddMySql(identityDbConnectionString, name: "IdentityDb")
+                            .AddMySql(logDbConnectionString, name: "LogDb")
+                            .AddMySql(auditLogDbConnectionString, name: "AuditLogDb")
                             .AddMySql(dataProtectionDbConnectionString, name: "DataProtectionDb");
                         break;
                     default:

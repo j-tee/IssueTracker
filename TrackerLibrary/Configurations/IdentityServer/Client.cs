@@ -10,5 +10,10 @@ namespace TrackerLibrary.Configurations.IdentityServer
     public class Client : global::IdentityServer4.Models.Client
     {
         public List<Claim> ClientClaims { get; set; } = new List<Claim>();
+
+        public IdentityServer4.EntityFramework.Entities.Client ToEntity()
+        {
+            throw new NotImplementedException();
+        }
     }
 }
